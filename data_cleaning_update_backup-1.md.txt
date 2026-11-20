@@ -1,0 +1,540 @@
+# Data Cleaning with UPDATE: Working on a Backup Table
+
+In the handout, every cleaning query is a **SELECT**: it shows what the cleaned data *would* look like, but nothing in the database changes. In this guide, the same cleaning rules are turned into real **UPDATE** statements.
+
+Because `UPDATE` and `DELETE` change data permanently, we never run them on the originals. Instead:
+
+```
+messy_customers  ──copy──►  customers_backup   (all UPDATEs happen here)
+messy_sales      ──copy──►  sales_backup       (all UPDATEs happen here)
+```
+
+`messy_customers` and `messy_sales` are never touched. If anything goes wrong, run **Step 0** again to get a fresh copy and start over.
+
+**Requirements:** MySQL 8.0 or newer, and `messy_dataset.sql` already loaded.
+
+## How to work
+
+1. For each step, run the **preview SELECT** first and look at the rows that would change.
+2. Then run the **UPDATE**.
+3. Run each UPDATE **once**. Some are not repeatable (for example, formatting a phone number twice breaks it). To redo your work, run Step 0 again.
+4. Run the **checkpoint** queries and compare with the numbers in the handout.
+
+## Three things that are different from SELECT
+
+- **`UPDATE` has no undo.** The `ALTER TABLE` statements also commit automatically, so a transaction can't protect you. The backup tables are your safety net.
+- **Fixing one column at a time is deliberate.** In MySQL, when one `UPDATE` sets several columns, later assignments can see the *already changed* values of earlier ones. One column per statement avoids surprises.
+- **Columns start as text.** To turn `age` into a number or `signup_date` into a real date, first clean the text with `UPDATE`, then change the column type with `ALTER TABLE ... MODIFY`.
+
+---
+
+# Step 0: Create the backup tables
+
+```sql
+USE practice_db;
+
+SET SQL_SAFE_UPDATES = 0;   -- Workbench safe mode blocks UPDATE/DELETE without a key in WHERE (only for this session)
+
+DROP TABLE IF EXISTS customers_backup;
+DROP TABLE IF EXISTS sales_backup;
+
+CREATE TABLE customers_backup LIKE messy_customers;   -- same columns and primary key
+INSERT INTO customers_backup SELECT * FROM messy_customers;
+
+CREATE TABLE sales_backup LIKE messy_sales;
+INSERT INTO sales_backup SELECT * FROM messy_sales;
+```
+
+Check that the copies match the originals:
+
+```sql
+SELECT 'customers' AS tbl,
+       (SELECT COUNT(*) FROM messy_customers)  AS original_rows,
+       (SELECT COUNT(*) FROM customers_backup) AS backup_rows
+UNION ALL
+SELECT 'sales',
+       (SELECT COUNT(*) FROM messy_sales),
+       (SELECT COUNT(*) FROM sales_backup);
+```
+
+Expected: 550 / 550 and 740 / 740.
+
+---
+
+# Part 1: Clean `customers_backup`
+
+## 1.1 Names: collapse spaces, then capitalize
+
+Preview:
+
+```sql
+SELECT customer_id, full_name AS before_,
+       TRIM(REGEXP_REPLACE(full_name, '[[:space:]]+', ' ')) AS after_
+FROM customers_backup
+WHERE full_name <> TRIM(REGEXP_REPLACE(full_name, '[[:space:]]+', ' '))
+LIMIT 8;
+```
+
+Two updates. The first trims and collapses spaces. The second capitalizes the first and last word (it reads the already-trimmed name):
+
+```sql
+UPDATE customers_backup
+SET full_name = TRIM(REGEXP_REPLACE(full_name, '[[:space:]]+', ' '));
+
+UPDATE customers_backup
+SET full_name = CONCAT(
+      UPPER(LEFT(SUBSTRING_INDEX(full_name, ' ', 1), 1)),
+      LOWER(SUBSTRING(SUBSTRING_INDEX(full_name, ' ', 1), 2)),
+      ' ',
+      UPPER(LEFT(SUBSTRING_INDEX(full_name, ' ', -1), 1)),
+      LOWER(SUBSTRING(SUBSTRING_INDEX(full_name, ' ', -1), 2))
+    );
+```
+
+## 1.2 Email: lowercase, blank to NULL, malformed to NULL
+
+Preview the rows that will become NULL:
+
+```sql
+SELECT customer_id, email
+FROM customers_backup
+WHERE TRIM(email) <> '' AND TRIM(email) NOT LIKE '%_@_%._%'
+LIMIT 8;
+```
+
+```sql
+-- 1) trim, lowercase, and turn blank text into NULL
+UPDATE customers_backup
+SET email = NULLIF(LOWER(TRIM(email)), '');
+
+-- 2) malformed emails (no @, or no dot after it) become NULL
+UPDATE customers_backup
+SET email = NULL
+WHERE email IS NOT NULL
+  AND email NOT LIKE '%_@_%._%';
+```
+
+## 1.3 Phone: keep digits, remove leading 1, reject bad lengths, format
+
+Preview the digits:
+
+```sql
+SELECT customer_id, phone AS raw_phone, REGEXP_REPLACE(phone, '[^0-9]', '') AS digits
+FROM customers_backup
+LIMIT 10;
+```
+
+Four small updates, run in this order. After step 1, blank and `N/A` phones become empty strings, which step 3 turns into NULL because their length is not 10:
+
+```sql
+-- 1) keep only the digits
+UPDATE customers_backup
+SET phone = REGEXP_REPLACE(phone, '[^0-9]', '')
+WHERE phone IS NOT NULL;
+
+-- 2) 11 digits starting with 1: drop the country code
+UPDATE customers_backup
+SET phone = SUBSTRING(phone, 2)
+WHERE LENGTH(phone) = 11 AND LEFT(phone, 1) = '1';
+
+-- 3) anything that is still not 10 digits is unusable
+UPDATE customers_backup
+SET phone = NULL
+WHERE phone IS NOT NULL AND LENGTH(phone) <> 10;
+
+-- 4) format as (XXX) XXX-XXXX
+UPDATE customers_backup
+SET phone = CONCAT('(', SUBSTRING(phone, 1, 3), ') ', SUBSTRING(phone, 4, 3), '-', SUBSTRING(phone, 7))
+WHERE phone IS NOT NULL;
+```
+
+## 1.4 Country: map the spellings to six standard values
+
+Preview (the same CASE as the handout):
+
+```sql
+SELECT country AS before_,
+       CASE
+         WHEN UPPER(REPLACE(TRIM(country), '.', '')) IN ('USA','US','UNITED STATES','UNITED STATES OF AMERICA') THEN 'USA'
+         WHEN UPPER(REPLACE(TRIM(country), '.', '')) IN ('UK','UNITED KINGDOM','GREAT BRITAIN') THEN 'UK'
+         WHEN UPPER(REPLACE(TRIM(country), '.', '')) IN ('CANADA','CA') THEN 'Canada'
+         WHEN UPPER(REPLACE(TRIM(country), '.', '')) IN ('GERMANY','DE','DEUTSCHLAND') THEN 'Germany'
+         WHEN UPPER(REPLACE(TRIM(country), '.', '')) IN ('INDIA','IN') THEN 'India'
+         WHEN UPPER(REPLACE(TRIM(country), '.', '')) IN ('PAKISTAN','PK') THEN 'Pakistan'
+       END AS after_,
+       COUNT(*) AS n
+FROM customers_backup
+GROUP BY country, after_
+ORDER BY after_, country;
+```
+
+```sql
+UPDATE customers_backup
+SET country = CASE
+    WHEN UPPER(REPLACE(TRIM(country), '.', '')) IN ('USA','US','UNITED STATES','UNITED STATES OF AMERICA') THEN 'USA'
+    WHEN UPPER(REPLACE(TRIM(country), '.', '')) IN ('UK','UNITED KINGDOM','GREAT BRITAIN') THEN 'UK'
+    WHEN UPPER(REPLACE(TRIM(country), '.', '')) IN ('CANADA','CA') THEN 'Canada'
+    WHEN UPPER(REPLACE(TRIM(country), '.', '')) IN ('GERMANY','DE','DEUTSCHLAND') THEN 'Germany'
+    WHEN UPPER(REPLACE(TRIM(country), '.', '')) IN ('INDIA','IN') THEN 'India'
+    WHEN UPPER(REPLACE(TRIM(country), '.', '')) IN ('PAKISTAN','PK') THEN 'Pakistan'
+  END;
+```
+
+> A value that matches no rule becomes NULL (there is no `ELSE`). Compare the NULL count before and after: it should stay at 27.
+
+## 1.5 Gender: Male, Female, Other
+
+```sql
+UPDATE customers_backup
+SET gender = CASE
+    WHEN UPPER(TRIM(gender)) IN ('M','MALE')   THEN 'Male'
+    WHEN UPPER(TRIM(gender)) IN ('F','FEMALE') THEN 'Female'
+    WHEN UPPER(TRIM(gender)) = 'OTHER'         THEN 'Other'
+  END;
+```
+
+## 1.6 Age: keep only valid ages, then make the column a number
+
+Preview of the filled-in values that will become NULL (expected: 37 rows; blank and NULL ages become NULL too):
+
+```sql
+SELECT customer_id, age
+FROM customers_backup
+WHERE age IS NOT NULL AND age <> ''
+  AND (age NOT REGEXP '^[0-9]+$' OR CAST(age AS UNSIGNED) NOT BETWEEN 18 AND 100);
+```
+
+```sql
+UPDATE customers_backup
+SET age = CASE
+    WHEN TRIM(age) REGEXP '^[0-9]+$' AND CAST(TRIM(age) AS UNSIGNED) BETWEEN 18 AND 100
+    THEN TRIM(age)
+  END;
+
+-- the column now only holds numbers or NULL, so we can change its type
+ALTER TABLE customers_backup MODIFY age INT NULL;
+```
+
+## 1.7 Signup date: text to a real DATE
+
+Three formats are mixed (slash dates are month first). First rewrite every value as `YYYY-MM-DD` (or NULL), then change the column type:
+
+```sql
+UPDATE customers_backup
+SET signup_date = CASE
+    WHEN TRIM(signup_date) REGEXP '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'    THEN STR_TO_DATE(TRIM(signup_date), '%Y-%m-%d')
+    WHEN TRIM(signup_date) REGEXP '^[0-9]{2}/[0-9]{2}/[0-9]{4}$'    THEN STR_TO_DATE(TRIM(signup_date), '%m/%d/%Y')
+    WHEN TRIM(signup_date) REGEXP '^[0-9]{2} [A-Za-z]{3} [0-9]{4}$' THEN STR_TO_DATE(TRIM(signup_date), '%d %b %Y')
+  END;
+
+ALTER TABLE customers_backup MODIFY signup_date DATE NULL;
+```
+
+## 1.8 City: blank to NULL
+
+```sql
+UPDATE customers_backup
+SET city = NULLIF(TRIM(city), '');
+```
+
+## Checkpoint A: NULL counts (before removing duplicates)
+
+```sql
+SELECT COUNT(*)                   AS total_rows,
+       SUM(email IS NULL)         AS email_null,        -- expected 77
+       SUM(phone IS NULL)         AS phone_null,        -- expected 70
+       SUM(country IS NULL)       AS country_null,      -- expected 27
+       SUM(gender IS NULL)        AS gender_null,       -- expected 77
+       SUM(age IS NULL)           AS age_null,          -- expected 76
+       SUM(signup_date IS NULL)   AS signup_date_null,  -- expected 41
+       COUNT(DISTINCT country)    AS distinct_countries -- expected 6
+FROM customers_backup;
+```
+
+If a number is off, stop here and find out why before going on. Deleting duplicates would hide the problem.
+
+## 1.9 Remove duplicate customers
+
+The name is now standardized, so it can serve as the duplicate key. Always **preview the rows that will be deleted**:
+
+```sql
+SELECT customer_id, full_name, email, phone
+FROM (
+  SELECT customer_id, full_name, email, phone,
+         ROW_NUMBER() OVER (PARTITION BY full_name ORDER BY customer_id) AS rn
+  FROM customers_backup
+) AS t
+WHERE rn > 1
+ORDER BY full_name
+LIMIT 10;
+```
+
+Expected: 50 rows in total would be removed (the copies with the higher `customer_id`). Now delete them:
+
+```sql
+DELETE FROM customers_backup
+WHERE customer_id IN (
+  SELECT customer_id FROM (
+    SELECT customer_id,
+           ROW_NUMBER() OVER (PARTITION BY full_name ORDER BY customer_id) AS rn
+    FROM customers_backup
+  ) AS t
+  WHERE rn > 1
+);
+```
+
+The extra `FROM (...) AS t` layer is what keeps MySQL from raising error 1093.
+
+```sql
+SELECT COUNT(*) AS customers_after_dedupe FROM customers_backup;   -- expected 500
+```
+
+---
+
+# Part 2: Clean `sales_backup`
+
+## 2.1 Product name, category and status
+
+```sql
+UPDATE sales_backup
+SET product_name = LOWER(TRIM(product_name));
+
+-- 8 spellings become 4: lower case, '&' becomes 'and', spaces removed, then mapped
+UPDATE sales_backup
+SET category = CASE REPLACE(REPLACE(LOWER(TRIM(category)), '&', 'and'), ' ', '')
+    WHEN 'electronics'    THEN 'Electronics'
+    WHEN 'homeandkitchen' THEN 'Home & Kitchen'
+    WHEN 'clothing'       THEN 'Clothing'
+    WHEN 'books'          THEN 'Books'
+  END;
+
+UPDATE sales_backup
+SET status = CASE LOWER(TRIM(status))
+    WHEN 'delivered' THEN 'Delivered'
+    WHEN 'shipped'   THEN 'Shipped'
+    WHEN 'cancelled' THEN 'Cancelled'
+    WHEN 'canceled'  THEN 'Cancelled'
+    WHEN 'returned'  THEN 'Returned'
+  END;
+```
+
+## 2.2 Quantity: whole numbers above 0
+
+Words (`one`, `two`, `three`) are converted because the intended value is clear. Blank, missing and negative values become NULL. Then the column becomes a number:
+
+```sql
+UPDATE sales_backup
+SET quantity = CASE
+    WHEN TRIM(quantity) REGEXP '^[0-9]+$' AND CAST(TRIM(quantity) AS UNSIGNED) > 0 THEN TRIM(quantity)
+    WHEN LOWER(TRIM(quantity)) = 'one'   THEN '1'
+    WHEN LOWER(TRIM(quantity)) = 'two'   THEN '2'
+    WHEN LOWER(TRIM(quantity)) = 'three' THEN '3'
+  END;
+
+ALTER TABLE sales_backup MODIFY quantity INT NULL;
+```
+
+> If your class decides **not** to convert the words, delete the three `WHEN ... 'one'/'two'/'three'` lines. The quantity NULL count will then be higher than 49.
+
+## 2.3 Unit price: strip symbols, validate, then make it DECIMAL
+
+Do **not** `CAST` before checking (`CAST('N/A' AS DECIMAL)` gives 0, a silent error):
+
+```sql
+-- 1) remove $, commas, USD and spaces
+UPDATE sales_backup
+SET unit_price = REPLACE(REPLACE(REPLACE(REPLACE(UPPER(unit_price), '$', ''), ',', ''), 'USD', ''), ' ', '')
+WHERE unit_price IS NOT NULL;
+
+-- 2) anything that is not a plain number (like N/A or blank) becomes NULL
+UPDATE sales_backup
+SET unit_price = NULL
+WHERE unit_price IS NOT NULL
+  AND unit_price NOT REGEXP '^[0-9]+(\\.[0-9]+)?$';
+
+-- 3) now it is safe to convert the type
+ALTER TABLE sales_backup MODIFY unit_price DECIMAL(10,2) NULL;
+```
+
+## 2.4 Sale date: text to a real DATE
+
+```sql
+UPDATE sales_backup
+SET sale_date = CASE
+    WHEN TRIM(sale_date) REGEXP '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'    THEN STR_TO_DATE(TRIM(sale_date), '%Y-%m-%d')
+    WHEN TRIM(sale_date) REGEXP '^[0-9]{2}/[0-9]{2}/[0-9]{4}$'    THEN STR_TO_DATE(TRIM(sale_date), '%m/%d/%Y')
+    WHEN TRIM(sale_date) REGEXP '^[0-9]{2} [A-Za-z]{3} [0-9]{4}$' THEN STR_TO_DATE(TRIM(sale_date), '%d %b %Y')
+  END;
+
+ALTER TABLE sales_backup MODIFY sale_date DATE NULL;
+```
+
+## Checkpoint B: sales NULL counts (before removing duplicates)
+
+```sql
+SELECT COUNT(*)                    AS total_rows,
+       SUM(quantity IS NULL)       AS quantity_null,      -- expected 49
+       SUM(unit_price IS NULL)     AS unit_price_null,    -- expected 55
+       SUM(sale_date IS NULL)      AS sale_date_null,     -- expected 0
+       COUNT(DISTINCT category)    AS categories,         -- expected 4
+       COUNT(DISTINCT status)      AS statuses,           -- expected 4
+       COUNT(DISTINCT product_name) AS products           -- expected 18
+FROM sales_backup;
+```
+
+## 2.5 Remove duplicate sales
+
+A duplicate has the same customer, product, quantity, price, date and status. Keep the lowest `sale_id`. Preview first (expected 40 rows):
+
+```sql
+SELECT sale_id, customer_id, product_name, quantity, unit_price, sale_date, status
+FROM (
+  SELECT *, ROW_NUMBER() OVER (
+           PARTITION BY customer_id, product_name, quantity, unit_price, sale_date, status
+           ORDER BY sale_id) AS rn
+  FROM sales_backup
+) AS t
+WHERE rn > 1
+ORDER BY customer_id
+LIMIT 10;
+```
+
+```sql
+DELETE FROM sales_backup
+WHERE sale_id IN (
+  SELECT sale_id FROM (
+    SELECT sale_id,
+           ROW_NUMBER() OVER (
+             PARTITION BY customer_id, product_name, quantity, unit_price, sale_date, status
+             ORDER BY sale_id) AS rn
+    FROM sales_backup
+  ) AS t
+  WHERE rn > 1
+);
+
+SELECT COUNT(*) AS sales_after_dedupe FROM sales_backup;   -- expected 700
+```
+
+---
+
+# Part 3: Derived columns with UPDATE
+
+In the handout (Session 3), derived columns were only calculated inside a `SELECT`. To **store** them, add a column with `ALTER TABLE ... ADD COLUMN`, then fill it with `UPDATE`.
+
+```sql
+ALTER TABLE customers_backup
+  ADD COLUMN email_domain      VARCHAR(100),
+  ADD COLUMN age_group         VARCHAR(10),
+  ADD COLUMN years_as_customer INT;
+
+UPDATE customers_backup
+SET email_domain = SUBSTRING_INDEX(email, '@', -1)
+WHERE email IS NOT NULL;
+
+UPDATE customers_backup
+SET age_group = CASE
+    WHEN age IS NULL THEN 'Unknown'
+    WHEN age < 25    THEN '18-24'
+    WHEN age < 35    THEN '25-34'
+    WHEN age < 50    THEN '35-49'
+    ELSE '50+'
+  END;
+
+-- a snapshot as of today: it will not update itself next year
+UPDATE customers_backup
+SET years_as_customer = TIMESTAMPDIFF(YEAR, signup_date, CURDATE())
+WHERE signup_date IS NOT NULL;
+```
+
+```sql
+ALTER TABLE sales_backup
+  ADD COLUMN line_total  DECIMAL(12,2),
+  ADD COLUMN order_size  VARCHAR(10);
+
+-- NULL if quantity or unit_price is missing (NULL * anything = NULL)
+UPDATE sales_backup
+SET line_total = quantity * unit_price;
+
+UPDATE sales_backup
+SET order_size = CASE
+    WHEN line_total IS NULL  THEN 'Unknown'
+    WHEN line_total >= 500   THEN 'Large'
+    WHEN line_total >= 100   THEN 'Medium'
+    ELSE 'Small'
+  END;
+```
+
+> **Think:** a stored derived column such as `years_as_customer` goes out of date, while a calculated one in a `SELECT` or a view is always fresh. When is each one the better choice?
+
+---
+
+# Part 4: Final validation
+
+The backup tables should now match the numbers in the handout, and the originals should be untouched:
+
+```sql
+SELECT 'customers_backup rows' AS check_name, COUNT(*) AS value, '500' AS expected FROM customers_backup
+UNION ALL SELECT 'sales_backup rows',            COUNT(*), '700' FROM sales_backup
+UNION ALL SELECT 'messy_customers rows (original)', COUNT(*), '550' FROM messy_customers
+UNION ALL SELECT 'messy_sales rows (original)',     COUNT(*), '740' FROM messy_sales
+UNION ALL SELECT 'original categories still messy', COUNT(DISTINCT category), '8' FROM messy_sales
+UNION ALL SELECT 'backup categories',               COUNT(DISTINCT category), '4' FROM sales_backup
+UNION ALL SELECT 'backup countries',                COUNT(DISTINCT country),  '6' FROM customers_backup;
+```
+
+See the result of the cleaning:
+
+```sql
+SELECT * FROM customers_backup LIMIT 10;
+SELECT * FROM sales_backup LIMIT 10;
+DESCRIBE customers_backup;
+DESCRIBE sales_backup;
+```
+
+`DESCRIBE` should show `age` as `int`, `signup_date` and `sale_date` as `date`, `unit_price` as `decimal(10,2)`. The columns were all text before.
+
+## Using the Part E analysis queries
+
+The handout's analysis queries use the names `customers_clean` and `sales_clean`. You have two options:
+
+**Option 1:** replace `customers_clean` with `customers_backup` and `sales_clean` with `sales_backup` in each query.
+
+**Option 2:** rename the finished tables once (note that this makes the "backup" names disappear). If `customers_clean` or `sales_clean` already exist, for example because you ran `data_cleaning_solution.sql`, the rename fails with error 1050. Use Option 1, or drop those old tables first:
+
+```sql
+RENAME TABLE customers_backup TO customers_clean,
+             sales_backup     TO sales_clean;
+```
+
+When you finish, turn safe-update mode back on:
+
+```sql
+SET SQL_SAFE_UPDATES = 1;
+```
+
+---
+
+# Quick map: handout SELECT → UPDATE
+
+| Handout section | What the SELECT did | What the UPDATE does here |
+|---|---|---|
+| 1.3 `NULLIF` | Showed blanks as NULL | `SET col = NULLIF(TRIM(col), '')` |
+| 1.4 `CASE` | Showed standard spellings | `SET country = CASE ... END` (same CASE, now saved) |
+| 1.5 invalid values | Listed bad ages and emails | `SET col = NULL WHERE <invalid>` or `CASE` that keeps only valid values |
+| 2.5 `ROW_NUMBER()` | Numbered duplicates | `DELETE ... WHERE id IN (rows with rn > 1)` |
+| 2.7 names | Showed before/after | `UPDATE ... SET full_name = CONCAT(...)` |
+| 2.8 phone | Showed formatted phone | Four small UPDATEs (digits, remove 1, reject, format) |
+| 2.9 dates | Showed `STR_TO_DATE` result | `UPDATE` to `YYYY-MM-DD`, then `ALTER ... MODIFY ... DATE` |
+| 2.10 prices | Showed `CAST` result | Strip symbols, NULL the invalid, then `ALTER ... DECIMAL` |
+| 3.2 derived columns | Calculated in a query | `ALTER ... ADD COLUMN`, then `UPDATE` |
+
+# Common problems
+
+| Problem | Fix |
+|---|---|
+| Error 1175 | Run `SET SQL_SAFE_UPDATES = 0;` (it is in Step 0). Only do this on the backup tables. |
+| Error 1093 on DELETE | Keep the extra `FROM (...) AS t` layer around the subquery. |
+| `Incorrect date value` or `Incorrect integer value` on ALTER | A value was not cleaned. Look for rows that do not match the expected pattern before you run `ALTER`. |
+| Numbers do not match a checkpoint | Run Step 0 again (clean start) and repeat the steps in order. Running a step twice can change the result. |
+| You ran a step twice | Run Step 0 again. The only way to undo an UPDATE is to rebuild the backup table. |
+| `Table 'customers_backup' doesn't exist` | Step 0 was not run, or the database is wrong. Run `USE practice_db;`. |
